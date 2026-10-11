@@ -11,48 +11,40 @@
 
 涉及 `deepseekv41-flash-0909` 临时镜像路径和后续统一缓存布局路径。下面的函数、字段及行为以这两个提交合并后的代码为准；版本兼容范围取决于实际缓存接口与布局，不以镜像版本号单独判断。
 
-## 1. 模型识别与 Connector 路由
+| dsv4.1变化             | 需要处理什么                                                |
+| ---------------------- | ----------------------------------------------------------- |
+| 压缩比例变化           | 重新计算逻辑 token 对应多少物理状态，以及地址偏移和传输长度 |
+| KV / Indexer 跨层复用  | 按实际注册的缓存条目统计，替代固定层数公式                  |
+| 临时状态与恢复要求变化 | 判断哪些组需要保存，哪些靠续算或 replay 重建                |
+| 新版 vLLM 缓存布局变化 | 适配统一视图、value/scale 排列、整页 padding 和 placement   |
 
-**概括：识别 V4.1 的缓存特征，确保模型进入正确的 HMA/FAWA 存取路径。**
+## 1. 跨层共享与缓存分组适配
 
-- 结合 `kv_source_layer_ids`、`index_source_layer_ids`、压缩配置和临时缓存组等信息识别 V4.1，避免只依赖某一种压缩比例判断模型类型。
-- 在 `UCMConnector` 中先判断是否属于 FAWA，再对其他模型执行 HLA 布局探测。
-- 避免 HLA 探测访问新版 `KVCacheTensor` 已不再提供的 `shared_by` 字段，也避免将 V4.1 的临时缓存组当成 HLA 的共享物理缓存区域。
+**按照实际缓存组和物理状态计算存取量。**
 
-**修改原因：** V4.1 的缓存组织和描述接口发生变化，Connector 的选择必须与实际缓存语义一致，否则还没进入存取流程就可能误判或报错。
-
-**主要位置：** `ucm_connector.py` 中的 `UCMConnector.__init__`；`hma_connector.py` 中的 `UCMFAWAConnector._init_group_metas`。
-
-## 2. 跨层共享与缓存分组适配
-
-**概括：按照实际缓存组和物理状态计算存取量，适应跨层共享后“模型层数”和“需要保存的缓存数量”不再一一对应的情况。**
+在原有register_kv_caches中，补充了对 V4.1 缓存布局的解析：结合实际张量和逐层规格，正确描述压缩状态、量化 value/scale 及完整页的地址和传输大小。
 
 - 基于 vLLM 注册的 `group.layer_names` 和 KV 张量建立存取描述，适应 KV 与 Indexer 的跨层复用；UCM 不按固定的模型层数或“每若干层复制一次”组织传输。
 - 兼容 `compress_ratio` 和 `tokens_per_state` 两类描述，区分一个 block 覆盖的逻辑 token 数与实际保存的物理状态数。
-- 对统一布局按每层 spec 计算物理状态数，例如逻辑 block 为 64 token、`tokens_per_state=2` 时，对应 32 个物理状态；同一组中不同层分别计算自己的偏移和传输长度。
-- 调用 vLLM 的 `resolve_kv_cache_block_sizes` 获取对齐信息：分段传输使用 hash 粒度，完整页传输使用 scheduler 对齐粒度。
 - 从实际 spec/page 大小动态推导 FA、WA 的存储量及 4 KB 对齐后的文件大小，并检查 scheduler 推导结果与 worker 实际布局是否一致。
 
 **修改原因：** 沿用 V4 的固定压缩比例、层数和文件大小，会造成逻辑 token、物理状态与实际传输字节数不匹配。
 
 **主要位置：** `KVCacheGroupLayout`、`_group_tokens_per_state_by_layer`、`_init_group_metas`、`_derive_v41_file_sizes`、`register_kv_caches`。
 
-## 3. 新旧 KV Cache Layout 兼容
+## 2.新旧 KV Cache Layout 兼容
 
-**概括：同时支持原有缓存视图和新版统一布局，确保量化数据、scale 与物理页内容完整对应。**
+**概括：同时支持原有缓存视图和新版统一布局，确保量化数据、scale 与物理页内容完整对应。在原有布局解析框架上，补充主 KV 和 Indexer 的 packed 格式识别，为 value、scale 分别生成传输描述，复用已有存取流程。**
 
 - 增加统一缓存视图的解析，明确 `[B, H, N, C]` 中的 `N` 表示物理状态数，不能直接当作逻辑 token block 大小，也不能误判成 K/V 维度。
+- 利用 vLLM 提供的 `tokens_per_state`，按每层压缩比例解析实际缓存，适配新版 layout 的状态数和传输范围。
 - 对 packed KV 建立 value、scale 两部分的地址和长度描述。补充主 KV 的 584/528/288 字节记录格式，以及 Indexer 的 68/132 字节格式，按实际 spec 选择对应布局。
 - 在分段传输路径中分别计算 value、scale 的起始位置、状态步长及复制长度，避免仅根据张量表面 shape 推算连续内存范围。
-- 对提供 placement 元数据的新版 `BLHNC/BLNHC` 布局，读取 `layers`、`layer_stride` 等信息；以张量实际地址和 block stride 定位，按完整 layer page 传输，包括页内 padding。
-- 完整页路径禁止页内偏移加载和部分页传输，并检查状态数、页大小、stride、压缩比例的整除关系。当前统一视图要求连续的单头状态区域，不能把该实现理解为支持任意布局。
-- 创建 Store 时移除会覆盖分段描述的旧 `tensor_size` 标量配置，确保实际使用 `tensor_size_list`。
-
-**修改原因：** 逻辑张量形状不一定能完整描述底层量化存储。漏掉 scale、忽略 padding 或错误切分物理页，都可能在外部命中后恢复出错误缓存。
+- [value0 value1 value2 value3 | scale0 scale1 scale2 scale3] ,取部分状态时
 
 **主要位置：** `KVCacheGroupLayout._build_layout`、`extract_addrs_with_offsets`、`segment_tensor_size_list`、`_group_physical_layout_by_layer`、`_v41_whole_page_sizes`、Store 创建逻辑。
 
-## 4. 持久化范围调整
+## 3. 持久化范围调整
 
 **概括：由 vLLM 的缓存组属性决定哪些状态需要存取，哪些状态应在续算时重建。**
 
@@ -65,9 +57,9 @@
 
 **主要位置：** `_init_group_metas`、`_create_wa_store`、`_lookup_external_hit_blocks`、`_select_group_blocks`，以及 load/dump 流程。
 
-## 5. 外部命中后的续算与 replay 适配
+## 4. 外部命中后的续算与 replay 适配
 
-**概括：让缓存命中边界、模型恢复位置和实际计算进度保持一致。**
+**概括：让缓存命中边界、模型恢复位置和实际计算进度保持一致。replay 期间不能把“命中到哪里”当成“实际算到哪里”，只有算过命中边界并产生新的完整块，才计划保存。**
 
 - 根据各组压缩粒度计算恢复对齐要求，并校验 hash block 能否覆盖完整的压缩组。
 - 当 prompt 长度恰好对齐完整 hash block 时，在 lookup 阶段保留最后一个完整块用于计算，避免加载块末状态后又退回该块内部续算。
@@ -79,7 +71,35 @@
 
 **主要位置：** `get_num_new_matched_tokens`、`_select_group_blocks`、`_generate_dispatch_meta`、`build_connector_meta`。
 
-## 6. 外部加载精度问题修复
+#### 示例：命中边界与 replay 计算进度
+
+假设 prompt 至少有 320 个 token，外部记录的 hash block 大小为 64 token：
+
+```text
+外部缓存命中：前 256 token
+需要 replay：命中前缀末尾的 128 token
+实际重算起点：256 - 128 = 128
+每步计算：64 token
+```
+
+此时需要区分两个位置：
+
+- **命中边界为 256**：持久化的 FA 缓存已经覆盖 `[0, 256)`。
+- **初始计算起点为 128**：模型需要重算 `[128, 256)`，重建未保存的状态，再继续计算后续 token。
+
+UCM 根据 scheduler 提供的实际 `num_computed_tokens` 生成 dump 计划：
+
+| 步骤   | 本步计算起点 | 本步计算范围   | 是否生成新 dump 计划                     |
+| ------ | -----------: | -------------- | ---------------------------------------- |
+| 第一步 |          128 | `[128, 192)` | 否，仍在已命中范围内重建状态             |
+| 第二步 |          192 | `[192, 256)` | 否，刚恢复到命中边界                     |
+| 第三步 |          256 | `[256, 320)` | 是，计划保存新完成的完整块`[256, 320)` |
+
+如果错误地把命中边界 256 当成第一步的计算起点，就会按 `256 + 64 = 320` 计划保存 `[256, 320)`。但这一轮模型实际只计算到 192，待保存的数据还没有生成。
+
+因此，**外部命中长度仍为 256；128 是 replay 的起点，不是修正后的命中长度。dump 计划必须跟随实际计算进度，只有越过命中边界并产生新的完整块后，才安排保存。**
+
+## 5. 外部加载精度问题修复
 
 **概括：修复模型执行流与外部加载流之间的竞争，避免加载的数据被后续设备写操作覆盖。**
 
@@ -95,27 +115,13 @@
 
 **主要位置：** `UCMFAWAConnector.start_load_kv`。
 
-## 7. 缓存隔离与回归验证
-
-**概括：防止不同布局误用同一份外部缓存，并为核心存取行为补充回归覆盖。**
-
-- 扩展 `RequestHasher` 的缓存命名空间，纳入 V4.1 布局版本、cache dtype、block size 和压缩配置。
-- 进一步纳入缓存组组成、传输开关、replay 参数，以及物理 placement 的层列表、layer stride、block stride、offset，区分不兼容的缓存格式。
-- 新版有 placement 时，不依赖 scheduler/worker 可能不同的合并后 spec 细节生成 key，避免两侧针对相同缓存布局生成不同 key。
-- 补充量化 value/scale 往返、压缩状态寻址、整页大小、临时组过滤、短窗口和全命中边界、FA-only 存取、replay dump 位置、加载同步及 V4 原有行为的测试。
-- 对无法解析的 block size、布局或传输字节数不一致等情况明确报错，避免静默使用猜测值继续存取。
-
-**修改原因：** 同一个模型名并不意味着缓存格式相同。格式发生变化后，需要自动隔离旧数据；同时必须保证 scheduler 和 worker 对同一格式使用一致的缓存 key。
-
-**主要位置：** `request_hasher.py` 中的 `RequestHasher`；`test/suites/Unit/test_ucm_v41_compat.py`。
-
 ## 代码范围与验证说明
 
-| 文件 | 主要职责 |
-| --- | --- |
-| `ucm/integration/vllm/ucm_connector.py` | Connector 选择顺序与 FAWA 路由 |
-| `ucm/integration/vllm/hma_connector.py` | 分组、layout、地址与字节数、持久化、replay、加载同步 |
-| `ucm/integration/vllm/request_hasher.py` | 缓存格式隔离与两侧 key 一致性 |
-| `test/suites/Unit/test_ucm_v41_compat.py` | V4.1 适配及 V4 兼容性回归测试 |
+| 文件                                        | 主要职责                                             |
+| ------------------------------------------- | ---------------------------------------------------- |
+| `ucm/integration/vllm/ucm_connector.py`   | Connector 选择顺序与 FAWA 路由                       |
+| `ucm/integration/vllm/hma_connector.py`   | 分组、layout、地址与字节数、持久化、replay、加载同步 |
+| `ucm/integration/vllm/request_hasher.py`  | 缓存格式隔离与两侧 key 一致性                        |
+| `test/suites/Unit/test_ucm_v41_compat.py` | V4.1 适配及 V4 兼容性回归测试                        |
 
 验证情况区分为两部分：临时镜像的外部命中精度问题已有用户实测修复反馈；新版 layout 的地址、字节数和状态流转有专门回归测试覆盖，其完整模型精度和性能仍以对应镜像上的实测结果为准。本文不将其他分支的测试数量或昇腾 HLA 适配结果计入 DS V4.1 的验证结论。
